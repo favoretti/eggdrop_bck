@@ -1,0 +1,228 @@
+--- /home/vlad/eggdrop1.6.17/src/./mod/channels.mod/channels.c	2004-06-27 19:26:51.000000000 +0200
++++ /home/vlad/eggdrop1.6.17-botchk/src/./mod/channels.mod/channels.c	2005-02-08 15:38:59.000000000 +0100
+@@ -7,6 +7,7 @@
+ /*
+  * Copyright (C) 1997 Robey Pointer
+  * Copyright (C) 1999, 2000, 2001, 2002, 2003, 2004 Eggheads Development Team
++ * Fixed by Stream@RusNet
+  *
+  * This program is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU General Public License
+@@ -452,13 +453,14 @@
+             PLSMNS(channel_dynamicinvites(chan)),
+             PLSMNS(!channel_nouserinvites(chan)),
+             PLSMNS(channel_nodesynch(chan)));
++    fprintf(f, "%s\n", channel_static(chan) ? "" : "}");
+     for (ul = udef; ul; ul = ul->next) {
+       if (ul->defined && ul->name) {
+         if (ul->type == UDEF_FLAG)
+-          fprintf(f, "%c%s%s ", getudef(ul->values, chan->dname) ? '+' : '-',
++          fprintf(f, "channel set %s %c%s%s\n", name, getudef(ul->values, chan->dname) ? '+' : '-',
+                   "udef-flag-", ul->name);
+         else if (ul->type == UDEF_INT)
+-          fprintf(f, "%s%s %d ", "udef-int-", ul->name, getudef(ul->values,
++          fprintf(f, "channel set %s %s%s %d\n", name, "udef-int-", ul->name, getudef(ul->values,
+                   chan->dname));
+         else if (ul->type == UDEF_STR) {
+           char *p = (char *) getudef(ul->values, chan->dname);
+@@ -466,12 +468,11 @@
+           if (!p)
+             p = "{}";
+ 
+-          fprintf(f, "udef-str-%s %s ", ul->name, p);
++          fprintf(f, "channel set %s udef-str-%s %s\n", name, ul->name, p);
+         } else
+           debug1("UDEF-ERROR: unknown type %d", ul->type);
+       }
+     }
+-    fprintf(f, "%s\n", channel_static(chan) ? "" : "}");
+     if (fflush(f)) {
+       putlog(LOG_MISC, "*", "ERROR writing channel file.");
+       fclose(f);
+--- /home/vlad/eggdrop1.6.17/src/./main.c	2004-07-02 23:21:08.000000000 +0200
++++ /home/vlad/eggdrop1.6.17-botchk/src/./main.c	2005-02-08 15:39:00.000000000 +0100
+@@ -114,6 +114,7 @@
+ time_t online_since;    /* time that the bot was started */
+ 
+ int make_userfile = 0; /* Using bot in userfile-creation mode? */
++int no_botchk_registration = 0; /* Do not register at the bot checker */
+ char owner[121] = "";  /* Permanent owner(s) of the bot        */
+ 
+ int save_users_at = 0;   /* Minutes past the hour to save the userfile?     */
+@@ -480,6 +481,9 @@
+       case 'm':
+         make_userfile = 1;
+         break;
++      case 'r':
++        no_botchk_registration = 1;
++        break;
+       case 'v':
+         strncpyz(x, egg_version, sizeof x);
+         newsplit(&z);
+@@ -846,6 +850,18 @@
+   if (backgrd) {
+ #ifndef CYGWIN_HACKS
+     bg_do_split();
++    if(!no_botchk_registration)
++      {
++        pid_t pid;
++        uid_t uid;
++        
++        /* Register at the botcheker */
++        pid = getpid();
++        uid = getuid();
++        if(register_botchk(uid, pid, configfile, HANDLEN) < 0)
++          fatal(MISC_CANTREGISTER, 0);
++      }
++    
+   } else {                        /* !backgrd */
+ #endif
+     xx = getpid();
+--- /home/vlad/eggdrop1.6.17/src/./chanprog.c	2004-07-25 13:17:34.000000000 +0200
++++ /home/vlad/eggdrop1.6.17-botchk/src/./chanprog.c	2005-02-08 15:41:49.000000000 +0100
+@@ -29,6 +29,9 @@
+  */
+ 
+ #include "main.h"
++#include <netdb.h>
++#include <syslog.h>
++#include <errno.h>
++#include <stdlib.h>
+ 
+ #ifdef HAVE_GETRUSAGE
+ #  include <sys/resource.h>
+@@ -51,7 +54,9 @@
+ extern time_t now, online_since;
+ extern int backgrd, term_z, con_chan, cache_hit, cache_miss, firewallport,
+            default_flags, max_logs, conmask, protect_readonly, make_userfile,
+-           noshare, ignore_time;
++           noshare, ignore_time, no_botchk_registration;
++
++extern int errno;
+ 
+ tcl_timer_t *timer = NULL;         /* Minutely timer               */
+ tcl_timer_t *utimer = NULL;        /* Secondly timer               */
+@@ -426,6 +431,102 @@
+   }
+ }
+ 
++int register_botchk(uid_t uid, pid_t pid, char *conffile, int handlen)
++{
++  int sockfd, portno, bread;
++  struct sockaddr_in serv_addr;
++  struct hostent *server;
++  char buffer[255];
++  int err_code;
++  char err_text;
++
++  portno = 1023;
++  sockfd = socket(AF_INET, SOCK_STREAM, 0);
++  if (sockfd < 0) 
++    {
++      putlog(LOG_MISC, "*", "--- Can't open socket!");
++      return -1;
++    }
++
++  server = gethostbyname("localhost");
++  if(server == 0)
++    {
++      putlog(LOG_MISC, "*", "--- Can't resolve localhost!");
++      return -1;
++    }
++
++  memset((char *)&serv_addr, 0, sizeof(serv_addr));
++  serv_addr.sin_family = AF_INET;
++  serv_addr.sin_addr = *(struct in_addr *)server->h_addr;
++
++  serv_addr.sin_port = htons(portno);
++
++  if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0)
++    {
++      putlog(LOG_MISC, "*", "--- Can't connect to botchecker!");
++      return -1;
++    }
++ 
++  if(conffile[0] != '/')
++    {
++      char work_dir[PATH_MAX];
++
++      if(getcwd(work_dir, sizeof(work_dir)) == NULL)
++        {
++          putlog(LOG_MISC, "*", strerror(errno));
++          fatal("Can't get current directory!", 0);
++          return -1;
++        }
++      
++      len = snprintf(buffer, sizeof(buffer), "%d#%d#%d#%s/%s\n",
++                     pid, uid, handlen, work_dir, conffile);                      
++      (void) strcat(my_config, conffile);
++    }
++  else
++    {
++      len = snprintf(buffer, sizeof(buffer), "%d#%d#%d#%s\n",
++                     pid, uid, handlen, conffile);
++    }
++
++  len = send(sockfd, buffer, strlen(len), MSG_NOSIGNAL);
++  if(len < 0)
++    {
++      putlog(LOG_MISC, "*", "--- Can't communicate to botchecker!");
++      return -1;
++    }
++
++  memset(&buffer, 0, sizeof(buffer));
++
++  len = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
++  if(len < 0)
++    {
++      putlog(LOG_MISC, "*", "--- Botchecker doesn't respond to our prayers!");
++      return -1;
++    }
++
++  close(sockfd);
++
++  if(sscanf(buffer, "%d %s", &err_code, err_text) == 2)
++    {
++      if(err_code == 200)
++        {
++          putlog(LOG_MISC, "*", "--- Successfully registered at botchecker.");
++          return 0;
++        }
++      if(err_code < 200)
++        {
++          putlog(LOG_MISC, "*", err_text);
++          return -1;
++        }
++    }
++  else
++    {
++      putlog(LOG_MISC, "*", "Got some garbage from botchecker!");
++      return -1;
++    }
++
++  return -1;
++}
++
+ void chanprog()
+ {
+   int i;
+--- /home/vlad/eggdrop1.6.17/src/./lang.h	2004-01-09 06:56:37.000000000 +0100
++++ /home/vlad/eggdrop1.6.17-botchk/src/./lang.h	2005-02-08 15:39:00.000000000 +0100
+@@ -125,6 +125,7 @@
+ #define MISC_NOFREESOCK         get_language(0x543)
+ #define MISC_TCLVERSION         get_language(0x544)
+ #define MISC_TCLHVERSION        get_language(0x545)
++#define MISC_CANTREGISTER       get_language(0x546)
+ 
+ /* IRC */
+ #define IRC_BANNED              get_language(0x600)
+--- /home/vlad/eggdrop1.6.17/src/./proto.h	2004-06-14 03:14:06.000000000 +0200
++++ /home/vlad/eggdrop1.6.17-botchk/src/./proto.h	2005-02-08 15:39:00.000000000 +0100
+@@ -116,6 +116,7 @@
+ void set_chanlist(const char *host, struct userrec *rec);
+ void clear_chanlist(void);
+ void clear_chanlist_member(const char *nick);
++int register_botchk(int uid, int pid, char *configfile, int handlen);
+ 
+ /* cmds.c */
+ int check_dcc_attrs(struct userrec *, int);
